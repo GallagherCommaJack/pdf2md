@@ -121,7 +121,7 @@ def _save_temp_image(page_index: int, image: Image.Image) -> str:
 def transcribe_pdf_pages(
     pdf_path: str,
     model: genai.GenerativeModel,
-    debug: bool = False,
+    page_limit: int = 0,
     workers_save: int = 4,
     workers_upload: int = 4,
     workers_chat: int = 4,
@@ -136,27 +136,9 @@ def transcribe_pdf_pages(
     images = pdf_to_images(pdf_path)
     transcribed_pages = []
 
-    # If debug mode is ON, just process one page synchronously (save -> upload -> chat).
-    if debug and images:
-        logger.info("Debug mode enabled: only processing the first page (no threading).")
-        page_index = 0
-        tmp_path = _save_temp_image(page_index, images[page_index])
-        gemini_file = upload_to_gemini(tmp_path, mime_type="image/png")
-        user_instructions = (
-            "transcribe the pdf page to markdown, including transcribing charts to tables, "
-            "but only label complex figures as [FIGURE NOT INCLUDED]. "
-            "Respond with an undecorated markdown string, appropriate for pasting into a markdown file."
-        )
-        chat_session = model.start_chat(history=[{"role": "user", "parts": [gemini_file]}])
-        response = chat_session.send_message(user_instructions)
-        txts_after_thinking = [part.text for part in response.parts[1:] if part.text]
-        page_text = "\n".join(txts_after_thinking)
-        transcribed_pages.append(page_text)
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            logger.warning(f"Failed to remove temporary file {tmp_path}.")
-        return transcribed_pages
+    if page_limit > 0:
+        logger.info(f"Limiting to first {page_limit} pages.")
+        images = images[:page_limit]
 
     # Otherwise, do this in three stages:
     #  1) save_temp  -> returns (page_index, tmp_path)
@@ -236,9 +218,10 @@ def main() -> None:
         help="Gemini API key. If not provided, uses GEMINI_API_KEY environment variable.",
     )
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="If set, only process the first PDF page, synchronously (no threading).",
+        "--page_limit",
+        type=int,
+        default=0,
+        help="If set, only process the first N pages. Use 0 for no limit.",
     )
     parser.add_argument(
         "--output",
@@ -306,7 +289,7 @@ def main() -> None:
     pages_md = transcribe_pdf_pages(
         pdf_path=pdf_path,
         model=model,
-        debug=args.debug,
+        page_limit=args.page_limit,
         workers_save=args.workers_save,
         workers_upload=args.workers_upload,
         workers_chat=args.workers_chat,
