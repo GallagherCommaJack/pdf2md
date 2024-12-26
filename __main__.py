@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from typing import List, Tuple
 
 # Third-party imports
@@ -114,6 +115,12 @@ def parse_args():
         default=False,
         help="If true, uses gemini-2.0-flash-thinking-exp-1219 and ignores the first response part. Otherwise uses gemini-1.5-flash and uses all parts.",
     )
+    parser.add_argument(
+        "--thinking_rate_limit",
+        type=int,
+        default=10,
+        help="Max pages/min when thinking is True (default=10)."
+    )
 
     return parser.parse_args()
 
@@ -186,6 +193,7 @@ def main():
         workers_chat=args.workers_chat,
         no_overlap=args.no_overlap,
         thinking=args.thinking,
+        thinking_rate_limit=args.thinking_rate_limit,
     )
 
     # -------------------------------------------------------------------------
@@ -281,6 +289,16 @@ def process_page(
     return page_text
 
 
+def _throttle_iter(iterable, items_per_minute: int):
+    """
+    Enforce a maximum rate of items_per_minute for the given iterable.
+    """
+    delay = 60.0 / items_per_minute
+    for item in iterable:
+        yield item
+        time.sleep(delay)
+
+
 def transcribe_pdf_pages(
     pdf_path: str,
     model: genai.GenerativeModel,
@@ -290,6 +308,7 @@ def transcribe_pdf_pages(
     workers_chat: int = 4,
     no_overlap: bool = False,
     thinking: bool = False,
+    thinking_rate_limit: int = 10,
 ) -> List[str]:
     """
     Converts the given PDF to images (one per page), then calls the Gemini API
@@ -333,6 +352,7 @@ def transcribe_pdf_pages(
             relevant_parts = response.parts
         txts = [part.text for part in relevant_parts if part.text]
         page_text = "\n".join(txts)
+
         return page_index, page_text
 
     # Create pipeline for stage 1
@@ -356,6 +376,11 @@ def transcribe_pdf_pages(
     if no_overlap:
         stage2 = list(tqdm(stage2, desc="Uploading pages", total=len(images)))
         stage2.sort(key=lambda x: x[0])
+
+    # Enforce the thinking rate limit by throttling the iterator
+    if thinking and thinking_rate_limit > 0:
+        stage2 = list(stage2)  # collect results to avoid partial consumption
+        stage2 = _throttle_iter(stage2, thinking_rate_limit)
 
     # Stage 3
     stage3 = pl.thread.map(
