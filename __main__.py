@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+import logging
 import os
 import sys
 import tempfile
 from typing import List, Tuple
-from argparse import Namespace
 
 try:
     import pypeln as pl
@@ -34,6 +34,8 @@ try:
 except ImportError:
     raise ImportError("Please install PIL: pip install Pillow")
 
+
+logger = logging.getLogger(__name__)
 
 ###############################################################################
 # Helper Function: Upload a file to Gemini
@@ -76,7 +78,44 @@ def pdf_to_images(pdf_path: str, dpi: int = 300) -> List[Image.Image]:
 ###############################################################################
 
 
-def transcribe_pdf_pages(pdf_path: str, model: genai.GenerativeModel, debug: bool = False) -> List[str]:
+def process_page(
+    page_index: int, image: Image.Image, model: genai.GenerativeModel
+) -> str:
+    """
+    Saves one PDF page to a temp file, uploads it to Gemini, and returns the transcription text.
+    """
+    tmp_path = _save_temp_image(page_index, image)
+    gemini_file = upload_to_gemini(tmp_path, mime_type="image/png")
+    user_instructions = (
+        "transcribe the pdf page to markdown, including transcribing charts to tables, "
+        "but only label complex figures as [FIGURE NOT INCLUDED]. "
+        "Respond with an undecorated markdown string, appropriate for pasting into a markdown file."
+    )
+    chat_session = model.start_chat(history=[{"role": "user", "parts": [gemini_file]}])
+    response = chat_session.send_message(user_instructions)
+    txts_after_thinking = [part.text for part in response.parts[1:] if part.text]
+    page_text = "\n".join(txts_after_thinking)
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        logger.warning(f"Failed to remove temporary file {tmp_path}.")
+    return page_text
+
+
+def _save_temp_image(page_index: int, image: Image.Image) -> str:
+    """
+    Saves a page image to a temporary PNG file and returns the path.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+        tmp_path = tmp_file.name
+    image.save(tmp_path, "PNG")
+    logger.info(f"Saved page {page_index} to temp file {tmp_path}")
+    return tmp_path
+
+
+def transcribe_pdf_pages(
+    pdf_path: str, model: genai.GenerativeModel, debug: bool = False
+) -> List[str]:
     """
     Converts the given PDF to images (one per page), then calls the Gemini API
     for each page to transcribe to Markdown (with special handling for figures, etc.).
@@ -84,96 +123,32 @@ def transcribe_pdf_pages(pdf_path: str, model: genai.GenerativeModel, debug: boo
     :param pdf_path: The path to the PDF file.
     :return: A list of strings, each containing the Markdown transcription of one page.
     """
-    # Convert PDF to images
     images = pdf_to_images(pdf_path)
     transcribed_pages = []
 
-    def save_temp(args: Tuple[int, Image.Image]) -> Tuple[int, str]:
-        """
-        Saves a page image to a temporary PNG file.
-        Returns (page_index, tmp_path).
-        """
-        page_index, image = args
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
-            tmp_path = tmp_file.name
-        image.save(tmp_path, "PNG")
-        return page_index, tmp_path
-
-    def send_gemini(args: Tuple[int, str]) -> Tuple[int, str]:
-        """
-        Uploads the temporary PNG file to Gemini, gets transcription.
-        Cleans up the temporary file. Returns (page_index, page_text).
-        """
-        page_index, tmp_path = args
-        gemini_file = upload_to_gemini(tmp_path, mime_type="image/png")
-        user_instructions = (
-            "transcribe the pdf page to markdown, including transcribing charts to tables, "
-            "but only label complex figures as [FIGURE NOT INCLUDED]."
-        )
-        chat_session = model.start_chat(
-            history=[{"role": "user", "parts": [gemini_file]}]
-        )
-        response = chat_session.send_message(user_instructions)
-        page_text = response.text
-
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-        return page_index, page_text
-
-    # If debug mode is ON, process only the first page, synchronously.
+    # If debug mode is ON, just process the first page in a synchronous manner
     if debug and images:
-        page_index = 0
-        # Save temp
-        print(f"Saving temp file for page {page_index}")
-        _, tmp_path = save_temp((page_index, images[page_index]))
-        print(f"Saved temp file to {tmp_path}")
-
-        # Upload and transcribe
-        print(f"Uploading temp file to Gemini for page {page_index}")
-        gemini_file = upload_to_gemini(tmp_path, mime_type="image/png")
-        print(f"Uploaded temp file to Gemini for page {page_index}")
-        user_instructions = (
-            "transcribe the pdf page to markdown, including transcribing charts to tables, "
-            "but only label complex figures as [FIGURE NOT INCLUDED]."
+        logger.info(
+            "Debug mode enabled: only processing the first page (no threading)."
         )
-        chat_session = model.start_chat(
-            history=[{"role": "user", "parts": [gemini_file]}]
-        )
-        print(f"Sending user instructions to Gemini for page {page_index}")
-        response = chat_session.send_message(user_instructions)
-        print(f"Received response from Gemini for page {page_index}")
-        page_text = response.text
+        page_text = process_page(0, images[0], model)
         transcribed_pages.append(page_text)
-
-        # Cleanup
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
         return transcribed_pages
 
-    # 1) Save each PDF page to a temp file in a background thread.
-    stage1 = pl.thread.map(
-        save_temp,
-        enumerate(images),
-        workers=1,
-        maxsize=len(images),
-    )
+    # Otherwise, process each page in parallel using pypeln
+    def sync_process(args: Tuple[int, Image.Image]) -> Tuple[int, str]:
+        page_index, image = args
+        logger.info(f"Threaded processing of page {page_index}")
+        return page_index, process_page(page_index, image, model)
 
-    # 2) Use multithreading to upload the temp files to Gemini and process them.
-    stage2 = pl.thread.map(
-        send_gemini,
-        stage1,
+    stage1 = pl.thread.map(
+        sync_process,
+        enumerate(images),
         workers=4,
         maxsize=len(images),
     )
 
-    # Collect results and sort them by page_index before returning.
-    results = list(tqdm(stage2, desc="Transcribing pages", total=len(images)))
+    results = list(tqdm(stage1, desc="Transcribing pages", total=len(images)))
     results.sort(key=lambda x: x[0])
     transcribed_pages = [x[1] for x in results]
 
@@ -190,7 +165,12 @@ def main() -> None:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="If set, only process the first PDF page, synchronously (no threading)."
+        help="If set, only process the first PDF page, synchronously (no threading).",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Path to an output file. If not specified, the transcription will be printed to stdout.",
     )
 
     args = parser.parse_args()
@@ -234,11 +214,17 @@ def main() -> None:
     print(f"Transcribing PDF: {pdf_path}")
     pages_md = transcribe_pdf_pages(pdf_path, model, debug=args.debug)
 
-    print("\n--- Transcription Results ---\n")
-    for i, page_md in enumerate(pages_md, start=1):
-        print(f"# Page {i}\n")
-        print(page_md)
-        print("\n\n")
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as out_file:
+            for i, page_md in enumerate(pages_md, start=1):
+                out_file.write(f"# Page {i}\n\n{page_md}\n\n\n")
+        print(f"Transcription results saved to {args.output}")
+    else:
+        print("\n--- Transcription Results ---\n")
+        for i, page_md in enumerate(pages_md, start=1):
+            print(f"# Page {i}\n")
+            print(page_md)
+            print("\n\n")
 
 
 if __name__ == "__main__":
