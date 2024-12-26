@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # Third-party imports
 try:
@@ -88,20 +88,20 @@ def parse_args():
     parser.add_argument(
         "--workers_save",
         type=int,
-        default=8,
-        help="Number of workers for saving PDFs to temp images (default=8).",
+        default=None,
+        help="Number of workers for saving PDFs to temp images (default=None).",
     )
     parser.add_argument(
         "--workers_upload",
         type=int,
-        default=1,
-        help="Number of workers for uploading images to Gemini (default=2).",
+        default=None,
+        help="Number of workers for uploading images to Gemini (default=None).",
     )
     parser.add_argument(
         "--workers_chat",
         type=int,
-        default=4,
-        help="Number of workers for chatting with Gemini (default=8).",
+        default=None,
+        help="Number of workers for chatting with Gemini (default=None).",
     )
     parser.add_argument(
         "--no_overlap",
@@ -119,13 +119,17 @@ def parse_args():
         "--thinking_rate_limit",
         type=int,
         default=10,
-        help="Max pages/min when thinking is True (default=10)."
+        help="Max pages/min when thinking is True (default=10).",
     )
 
     return parser.parse_args()
 
 
 def main():
+    import multiprocessing
+
+    multiprocessing.set_start_method("spawn")
+
     # -------------------------------------------------------------------------
     # 1) Parse command line arguments
     # -------------------------------------------------------------------------
@@ -217,15 +221,29 @@ def main():
 ###############################################################################
 
 
-def upload_to_gemini(path: str, mime_type: str = None):
+def gemini_config_and_upload(
+    path: str, mime_type: str = None, api_key: str = None
+) -> genai.types.File:
     """
-    Uploads the given file to Gemini.
-    See https://ai.google.dev/gemini-api/docs/prompting_with_media
+    Self-contained function for configuring Gemini and uploading a file.
+    This allows usage with multiprocessing and 'spawn'.
+    """
+    # 1) Resolve API key
+    if not api_key:
+        if os.path.exists(".api_key"):
+            with open(".api_key", "r") as f:
+                api_key = f.read().strip()
+        else:
+            api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "No API key provided. Either pass explicit_api_key or set GEMINI_API_KEY or .api_key"
+        )
 
-    :param path: Path to the local file you want to upload.
-    :param mime_type: MIME type (e.g., "image/png", "image/jpg").
-    :return: A Gemini File object (with .uri, .display_name, etc.).
-    """
+    # 2) Configure Gemini
+    genai.configure(api_key=api_key)
+
+    # 3) Upload file
     file = genai.upload_file(path, mime_type=mime_type)
     logger.info(f"Uploaded file '{file.display_name}' as: {file.uri}")
     return file
@@ -265,7 +283,7 @@ def process_page(
     Saves one PDF page to a temp file, uploads it to Gemini, and returns the transcription text.
     """
     tmp_path = _save_temp_image(page_index, image)
-    gemini_file = upload_to_gemini(tmp_path, mime_type="image/png")
+    gemini_file = gemini_config_and_upload(tmp_path, mime_type="image/png")
 
     user_instructions = (
         "transcribe the pdf page to markdown, including transcribing charts to tables, "
@@ -299,13 +317,27 @@ def _throttle_iter(iterable, items_per_minute: int):
         time.sleep(delay)
 
 
+# Stage 1: save images
+def save_temp(args: Tuple[int, Image.Image]) -> Tuple[int, str]:
+    page_index, img = args
+    return page_index, _save_temp_image(page_index, img)
+
+
+# Stage 2: upload
+def upload_gemini_stage(args: Tuple[int, str]) -> Tuple[int, genai.types.File]:
+    page_index, tmp_path = args
+    # Using our self-contained config & upload function
+    gem_file = gemini_config_and_upload(tmp_path, mime_type="image/png")
+    return page_index, gem_file
+
+
 def transcribe_pdf_pages(
     pdf_path: str,
     model: genai.GenerativeModel,
     page_limit: int = 0,
-    workers_save: int = 4,
-    workers_upload: int = 4,
-    workers_chat: int = 4,
+    workers_save: Optional[int] = None,
+    workers_upload: Optional[int] = None,
+    workers_chat: Optional[int] = None,
     no_overlap: bool = False,
     thinking: bool = False,
     thinking_rate_limit: int = 10,
@@ -322,19 +354,13 @@ def transcribe_pdf_pages(
         logger.info(f"Limiting to first {page_limit} pages.")
         images = images[:page_limit]
 
-    # If no_overlap is True, do each stage sequentially
-    logger.info("Running pipeline with overlap using pypeln.")
-
-    # Stage 1: save images
-    def save_temp(args: Tuple[int, Image.Image]) -> Tuple[int, str]:
-        page_index, img = args
-        return page_index, _save_temp_image(page_index, img)
-
-    # Stage 2: upload
-    def upload_gemini_stage(args: Tuple[int, str]) -> Tuple[int, genai.types.File]:
-        page_index, tmp_path = args
-        gem_file = upload_to_gemini(tmp_path, mime_type="image/png")
-        return page_index, gem_file
+    # If any of the worker counts are None, default them to number of pages
+    if workers_save is None:
+        workers_save = len(images)
+    if workers_upload is None:
+        workers_upload = len(images)
+    if workers_chat is None:
+        workers_chat = len(images)
 
     # Stage 3: chat
     def chat_gemini_stage(args: Tuple[int, genai.types.File]) -> Tuple[int, str]:
@@ -367,7 +393,7 @@ def transcribe_pdf_pages(
         stage1.sort(key=lambda x: x[0])
 
     # Stage 2
-    stage2 = pl.thread.map(
+    stage2 = pl.process.map(
         upload_gemini_stage,
         stage1,
         workers=workers_upload,
