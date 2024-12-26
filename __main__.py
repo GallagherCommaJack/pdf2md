@@ -193,13 +193,13 @@ def transcribe_pdf_pages(
         workers=workers_upload,
         maxsize=len(images),
     )
-    results_stage2 = list(tqdm(stage2, desc="Uploading pages", total=len(images)))
-    results_stage2.sort(key=lambda x: x[0])
+    # results_stage2 = list(tqdm(stage2, desc="Uploading pages", total=len(images)))
+    # results_stage2.sort(key=lambda x: x[0])
 
     # Stage 3: chat
     stage3 = tmap(
         chat_gemini_stage,
-        results_stage2,
+        stage2,
         workers=workers_chat,
         maxsize=len(images),
     )
