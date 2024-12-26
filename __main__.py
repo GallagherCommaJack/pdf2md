@@ -112,7 +112,7 @@ def parse_args():
         "--thinking",
         action="store_true",
         default=False,
-        help="If true, uses gemini-2.0-flash-thinking-exp-1219 and ignores the first response part. Otherwise uses gemini-2.0-flash-exp and uses all parts.",
+        help="If true, uses gemini-2.0-flash-thinking-exp-1219 and ignores the first response part. Otherwise uses gemini-1.5-flash and uses all parts.",
     )
 
     return parser.parse_args()
@@ -146,10 +146,11 @@ def main():
     genai.configure(api_key=api_key)
 
     # Decide which model name to use based on --thinking
+    # NOTE: thinking only supports 10 pages / minute
     if args.thinking:
         model_name = "gemini-2.0-flash-thinking-exp-1219"
     else:
-        model_name = "gemini-2.0-flash-exp"
+        model_name = "gemini-1.5-flash"
 
     generation_config = {
         "temperature": 1,
@@ -341,13 +342,14 @@ def transcribe_pdf_pages(
         workers=workers_save,
         maxsize=len(images),
     )
-    results_stage1 = list(tqdm(stage1, desc="Saving pages", total=len(images)))
-    results_stage1.sort(key=lambda x: x[0])
+    if no_overlap:
+        stage1 = list(tqdm(stage1, desc="Saving pages", total=len(images)))
+        stage1.sort(key=lambda x: x[0])
 
     # Stage 2
     stage2 = pl.thread.map(
         upload_gemini_stage,
-        results_stage1,
+        stage1,
         workers=workers_upload,
         maxsize=len(images),
     )
@@ -362,7 +364,7 @@ def transcribe_pdf_pages(
         workers=workers_chat,
         maxsize=len(images),
     )
-    results_stage3 = list(tqdm(stage3, desc="Chatting pages", total=len(images)))
+    results_stage3 = list(tqdm(stage3, desc="Transcribing pages", total=len(images)))
     results_stage3.sort(key=lambda x: x[0])
 
     transcribed_pages = [x[1] for x in results_stage3]
