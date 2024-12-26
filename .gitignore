@@ -3,3 +3,4 @@
 .env
 *.pycache
 *.pyc
+out/*

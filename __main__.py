@@ -34,6 +34,11 @@ try:
 except ImportError:
     raise ImportError("Please install PIL: pip install Pillow")
 
+try:
+    from pypeln.thread import map as tmap
+except ImportError:
+    raise ImportError("Please install pypeln: pip install pypeln")
+
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +57,7 @@ def upload_to_gemini(path: str, mime_type: str = None):
     :return: A Gemini File object (with .uri, .display_name, etc.).
     """
     file = genai.upload_file(path, mime_type=mime_type)
-    print(f"Uploaded file '{file.display_name}' as: {file.uri}")
+    logger.info(f"Uploaded file '{file.display_name}' as: {file.uri}")
     return file
 
 
@@ -114,7 +119,12 @@ def _save_temp_image(page_index: int, image: Image.Image) -> str:
 
 
 def transcribe_pdf_pages(
-    pdf_path: str, model: genai.GenerativeModel, debug: bool = False
+    pdf_path: str,
+    model: genai.GenerativeModel,
+    debug: bool = False,
+    workers_save: int = 4,
+    workers_upload: int = 4,
+    workers_chat: int = 4,
 ) -> List[str]:
     """
     Converts the given PDF to images (one per page), then calls the Gemini API
@@ -126,32 +136,95 @@ def transcribe_pdf_pages(
     images = pdf_to_images(pdf_path)
     transcribed_pages = []
 
-    # If debug mode is ON, just process the first page in a synchronous manner
+    # If debug mode is ON, just process one page synchronously (save -> upload -> chat).
     if debug and images:
-        logger.info(
-            "Debug mode enabled: only processing the first page (no threading)."
+        logger.info("Debug mode enabled: only processing the first page (no threading).")
+        page_index = 0
+        tmp_path = _save_temp_image(page_index, images[page_index])
+        gemini_file = upload_to_gemini(tmp_path, mime_type="image/png")
+        user_instructions = (
+            "transcribe the pdf page to markdown, including transcribing charts to tables, "
+            "but only label complex figures as [FIGURE NOT INCLUDED]. "
+            "Respond with an undecorated markdown string, appropriate for pasting into a markdown file."
         )
-        page_text = process_page(0, images[0], model)
+        chat_session = model.start_chat(history=[{"role": "user", "parts": [gemini_file]}])
+        response = chat_session.send_message(user_instructions)
+        txts_after_thinking = [part.text for part in response.parts[1:] if part.text]
+        page_text = "\n".join(txts_after_thinking)
         transcribed_pages.append(page_text)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            logger.warning(f"Failed to remove temporary file {tmp_path}.")
         return transcribed_pages
 
-    # Otherwise, process each page in parallel using pypeln
-    def sync_process(args: Tuple[int, Image.Image]) -> Tuple[int, str]:
-        page_index, image = args
-        logger.info(f"Threaded processing of page {page_index}")
-        return page_index, process_page(page_index, image, model)
+    # Otherwise, do this in three stages:
+    #  1) save_temp  -> returns (page_index, tmp_path)
+    #  2) upload_gemini -> returns (page_index, gemini_file, tmp_path)
+    #  3) chat_gemini   -> returns (page_index, page_text)
 
-    stage1 = pl.thread.map(
-        sync_process,
+    def save_temp(args: Tuple[int, Image.Image]) -> Tuple[int, str]:
+        page_index, img = args
+        logger.info(f"Saving page {page_index} to temp file.")
+        path = _save_temp_image(page_index, img)
+        return page_index, path
+
+    def upload_gemini_stage(args: Tuple[int, str]) -> Tuple[int, genai.types.File, str]:
+        page_index, tmp_path = args
+        logger.info(f"Uploading page {page_index} to Gemini.")
+        gem_file = upload_to_gemini(tmp_path, mime_type="image/png")
+        return page_index, gem_file, tmp_path
+
+    def chat_gemini_stage(args: Tuple[int, genai.types.File, str]) -> Tuple[int, str]:
+        page_index, gem_file, tmp_path = args
+        logger.info(f"Chatting page {page_index} with Gemini.")
+        user_instructions = (
+            "transcribe the pdf page to markdown, including transcribing charts to tables, "
+            "but only label complex figures as [FIGURE NOT INCLUDED]. "
+            "Respond with an undecorated markdown string, appropriate for pasting into a markdown file."
+        )
+        chat_session = model.start_chat(history=[{"role": "user", "parts": [gem_file]}])
+        response = chat_session.send_message(user_instructions)
+        txts_after_thinking = [part.text for part in response.parts[1:] if part.text]
+        page_text = "\n".join(txts_after_thinking)
+        # Remove temp file after chat
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            logger.warning(f"Failed to remove temporary file {tmp_path}.")
+        return page_index, page_text
+
+    # Create pipeline for stage 1: saving images
+    stage1 = tmap(
+        save_temp,
         enumerate(images),
-        workers=4,
+        workers=workers_save,
         maxsize=len(images),
     )
+    results_stage1 = list(tqdm(stage1, desc="Saving pages", total=len(images)))
+    results_stage1.sort(key=lambda x: x[0])
 
-    results = list(tqdm(stage1, desc="Transcribing pages", total=len(images)))
-    results.sort(key=lambda x: x[0])
-    transcribed_pages = [x[1] for x in results]
+    # Stage 2: uploading
+    stage2 = tmap(
+        upload_gemini_stage,
+        results_stage1,
+        workers=workers_upload,
+        maxsize=len(images),
+    )
+    results_stage2 = list(tqdm(stage2, desc="Uploading pages", total=len(images)))
+    results_stage2.sort(key=lambda x: x[0])
 
+    # Stage 3: chat
+    stage3 = tmap(
+        chat_gemini_stage,
+        results_stage2,
+        workers=workers_chat,
+        maxsize=len(images),
+    )
+    results_stage3 = list(tqdm(stage3, desc="Chatting pages", total=len(images)))
+    results_stage3.sort(key=lambda x: x[0])
+
+    transcribed_pages = [x[1] for x in results_stage3]
     return transcribed_pages
 
 
@@ -171,6 +244,24 @@ def main() -> None:
         "--output",
         "-o",
         help="Path to an output file. If not specified, the transcription will be printed to stdout.",
+    )
+    parser.add_argument(
+        "--workers_save",
+        type=int,
+        default=8,
+        help="Number of workers for saving PDFs to temp images (default=8).",
+    )
+    parser.add_argument(
+        "--workers_upload",
+        type=int,
+        default=1,
+        help="Number of workers for uploading images to Gemini (default=2).",
+    )
+    parser.add_argument(
+        "--workers_chat",
+        type=int,
+        default=8,
+        help="Number of workers for chatting with Gemini (default=8).",
     )
 
     args = parser.parse_args()
@@ -212,7 +303,14 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Transcribing PDF: {pdf_path}")
-    pages_md = transcribe_pdf_pages(pdf_path, model, debug=args.debug)
+    pages_md = transcribe_pdf_pages(
+        pdf_path=pdf_path,
+        model=model,
+        debug=args.debug,
+        workers_save=args.workers_save,
+        workers_upload=args.workers_upload,
+        workers_chat=args.workers_chat,
+    )
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as out_file:
