@@ -1,7 +1,7 @@
 # PDF Transcription with Gemini
 
 This project provides a command-line application for transcribing PDFs using Google's Gemini model.  
-[Example output](examples/deepseek.txt)
+[Example output here.](examples/deepseek.txt)
 It converts PDF pages into images, uploads them to Gemini, and returns transcriptions in Markdown format.
 Dependencies handled by uv, see pyproject.toml.
 
