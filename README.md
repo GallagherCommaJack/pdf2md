@@ -10,7 +10,7 @@ Dependencies handled by uv, see pyproject.toml.
 Run the script with the path to the PDF and any additional arguments you need:
 
 ```bash
-./main.py --api_key=YOUR_GEMINI_API_KEY path/to/input.pdf \
+python __main__.py --api_key=YOUR_GEMINI_API_KEY path/to/input.pdf \
     --output=transcription.md \
     --page_limit=5
 ```
